@@ -1,0 +1,25 @@
+[package]
+name = "ensicoin_client"
+version = "0.1.0"
+authors = ["Quentin Boyer <qbsecond@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tower-grpc = "0.1.0"
+futures = {version = "0.1.28"}
+futures_new = {version = "0.3.0-alpha.18", features = ["compat"], package="futures-preview"}
+hyper = "0.12.33"
+tokio = "0.1.22"
+tower-hyper = "0.1.1"
+tower-util = "0.1.0"
+prost = "0.5.0"
+prost-derive = "0.5.0"
+bytes = "0.4.12"
+http = "0.1.18"
+log = "0.4.8"
+tower-request-modifier = "0.1.0"
+
+[build-dependencies]
+tower-grpc-build = "0.1.0"
