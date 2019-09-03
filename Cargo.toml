@@ -1,5 +1,5 @@
 [package]
-name = "ensicoin_client"
+name = "arc_libclient"
 version = "0.1.0"
 authors = ["Quentin Boyer <qbsecond@gmail.com>"]
 edition = "2018"
