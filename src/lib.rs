@@ -121,6 +121,7 @@ pub struct Wallet {
 struct Point {
     pub height: u64,
     pub hash: Vec<u8>,
+    pub previous_hash: Vec<u8>,
     pub effects: Vec<Effect>,
 }
 
@@ -128,19 +129,35 @@ type Data = Arc<RwLock<Wallet>>;
 
 pub async fn update_balance(uri: http::Uri, wallet: Data) -> Result<(), Error> {
     let stream = following_txs(uri, wallet.clone()).await?;
-    let fut = futures_new::compat::Compat01As03::new(stream.for_each(|point| {
-        let mut new_tx = Vec::new();
-        let mut rem_tx = Vec::new();
-        match wallet.read().stack.last() {
-            None => {
-                for effect in &point.effects() {
-                    if effect.kind == EffectKind::Credit {
-                        new_tx.push((effect.target.clone(), effect.amount));
+    futures_new::compat::Compat01As03::new(stream.for_each(|point| {
+        let mut wallet = wallet.write();
+        let last_valid = loop {
+            match wallet.stack.pop() {
+            Some(stack_point) => {
+                    if stack_point.hash == point.previous_hash {
+                        break Some(stack_point);
+                    } else {
+                        for Effect{amount, target, kind} in stack_point.effects {
+                            match kind {
+                                EffectKind::Credit => {
+                                    wallet.owned_tx.remove(&target);
+                                }
+                                EffectKind::Spend => {
+                                    wallet.owned_tx.insert(target, amount);
+                                }
+                            }
+                        }
                     }
                 }
+                None => break None
             }
+        };
+        if let Some(last_valid) = last_valid {
+            wallet.stack.push(last_valid)
         }
-    })).await;
+        wallet.stack.push(point);
+        Ok(())
+    })).await?;
     Ok(())
 }
 
@@ -181,8 +198,8 @@ async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< Item
                 .map_err(Error::from)
         }).map(|reply| reply.into_inner())
         .map(move |reply| match reply.block {
-            Some(block) => Point{height: block.height as u64,hash: block.hash, effects: affecting_tx(block.txs, wallet.clone())},
-            None => Point{height:0, effects: Vec::new(), hash: Vec::new()},
+            Some(block) => Point{height: block.height as u64,hash: block.hash, previous_hash: block.prev_block,effects: affecting_tx(block.txs, wallet.clone())},
+            None => Point{height:0, effects: Vec::new(), hash: Vec::new(), previous_hash: Vec::new()},
         }).filter(
             |p| !p.effects.is_empty()
         );
