@@ -4,8 +4,13 @@ use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
 use std::sync::Arc;
+use parking_lot::RwLock;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use ensicoin_messages::resource::script::OP;
+use ensicoin_serializer::{Deserialize, Deserializer, Serialize};
+
+#[macro_use] extern crate log;
 
 pub mod node {
     include!(concat!(env!("OUT_DIR"), "/ensicoin_rpc.rs"));
@@ -17,7 +22,6 @@ type PubKey = [u8; 33];
 
 pub struct BalanceUpdate {
     pub tx: Tx,
-    pub amount: i64,
     pub block: Vec<u8>,
 }
 
@@ -46,26 +50,101 @@ impl From<tower_grpc::Status> for Error {
     }
 }
 
-fn has_debiting_tx(response: &Block, wallet: Data) -> bool {
-    for tx in &response.txs {
-        for input in &tx.inputs {
-            if let Some(outpoint) = &input.previous_output {
-                if wallet.owned_tx.contains(&outpoint.hash) {
-                    return true;
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct Outpoint {
+    pub hash: Vec<u8>,
+    pub index: u32,
+}
+
+impl From<node::Outpoint> for Outpoint {
+    fn from(value: node::Outpoint) -> Self {
+        Self {
+            hash: value.hash,
+            index: value.index,
+        }
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Copy, Clone)]
+pub enum EffectKind {
+    Spend,
+    Credit,
+}
+
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct Effect {
+    pub amount: u64,
+    pub target: Outpoint,
+    pub kind: EffectKind,
+}
+
+fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
+    let wallet = wallet.read();
+    let mut affect = Vec::new();
+    let mut script = vec![OP::Dup, OP::Hash160];
+    script.extend_from_slice(&wallet.pub_key_hash_code);
+    script.append(&mut vec![OP::Equal, OP::Verify, OP::Checksig]);
+    for tx in response {
+        let hash = tx.hash;
+        for input in tx.inputs {
+            if let Some(outpoint) = input.previous_output {
+                let utxo = Outpoint::from(outpoint);
+                if let Some(value) = wallet.owned_tx.get(&utxo) {
+                    affect.push(Effect{kind: EffectKind::Spend,target: utxo,amount: *value});
                 }
             }
         }
+        for (output_index, output) in tx.outputs.into_iter().enumerate() {  
+            let value = output.value;
+            let mut de = Deserializer::new(bytes::BytesMut::from(output.script));
+            match Vec::<OP>::deserialize(&mut de) {
+                Ok(v) => {
+                    if v == script {
+                        affect.push(Effect{kind: EffectKind::Credit, target: Outpoint{hash: hash.clone(), index: output_index as u32}, amount: value});
+                    }
+                }
+                Err(e) => warn!("Invalid script in tx: {:?}",e)
+            };
+        }
     }
-    return false;
+    affect
 }
 
 pub struct Wallet {
-    pub owned_tx: HashSet<Vec<u8>>,
+    pub owned_tx: HashMap<Outpoint, u64>,
+    pub pub_key: PubKey,
+    pub_key_hash_code: Vec<OP>,
+    stack: Vec<Point>,
 }
 
-type Data = Arc<Wallet>;
+struct Point {
+    pub height: u64,
+    pub hash: Vec<u8>,
+    pub effects: Vec<Effect>,
+}
 
-pub async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< Item = Block, Error = Error>, Error> {
+type Data = Arc<RwLock<Wallet>>;
+
+pub async fn update_balance(uri: http::Uri, wallet: Data) -> Result<(), Error> {
+    let stream = following_txs(uri, wallet.clone()).await?;
+    let fut = futures_new::compat::Compat01As03::new(stream.for_each(|point| {
+        let mut new_tx = Vec::new();
+        let mut rem_tx = Vec::new();
+        match wallet.read().stack.last() {
+            None => {
+                for effect in &point.effects() {
+                    if effect.kind == EffectKind::Credit {
+                        new_tx.push((effect.target.clone(), effect.amount));
+                    }
+                }
+            }
+        }
+    })).await;
+    Ok(())
+}
+
+async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< Item = Point, Error = Error>, Error> {
     let dst = Destination::try_from_uri(uri.clone())?;
     let connector = util::Connector::new(HttpConnector::new(4));
     let settings = client::Builder::new().http2_only(true).clone();
@@ -101,9 +180,11 @@ pub async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< 
                 }))
                 .map_err(Error::from)
         }).map(|reply| reply.into_inner())
-        .filter(move |reply| match &reply.block {
-            Some(block) => has_debiting_tx(&block, wallet.clone()),
-            None => false,
-        }).map(|reply| reply.block.unwrap());
+        .map(move |reply| match reply.block {
+            Some(block) => Point{height: block.height as u64,hash: block.hash, effects: affecting_tx(block.txs, wallet.clone())},
+            None => Point{height:0, effects: Vec::new(), hash: Vec::new()},
+        }).filter(
+            |p| !p.effects.is_empty()
+        );
     Ok(response_stream)
 }
