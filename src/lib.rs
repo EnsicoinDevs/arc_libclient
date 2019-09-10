@@ -1,35 +1,37 @@
 use futures::{Future, Stream};
 use hyper::client::connect::{Destination, HttpConnector};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
-use std::sync::Arc;
-use parking_lot::RwLock;
 
-use std::collections::{HashSet, HashMap};
 use ensicoin_messages::resource::script::OP;
 use ensicoin_serializer::{Deserialize, Deserializer, Serialize};
+use std::collections::{HashMap, HashSet};
 
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
 
 pub mod node {
     include!(concat!(env!("OUT_DIR"), "/ensicoin_rpc.rs"));
 }
 
 use node::{Block, GetBestBlocksRequest, GetBlockByHashRequest, PublishRawTxRequest, Tx};
-
-type PubKey = [u8; 33];
-
-pub struct BalanceUpdate {
-    pub tx: Tx,
-    pub block: Vec<u8>,
-}
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 #[derive(Debug)]
 pub enum Error {
     GrpcError(tower_grpc::Status),
     TransportError(hyper::Error),
     ConnectError(tower_hyper::client::ConnectError<std::io::Error>),
+    ChannelError,
+}
+
+impl From<tokio::sync::mpsc::error::SendError> for Error {
+    fn from(_: tokio::sync::mpsc::error::SendError) -> Self {
+        Self::ChannelError
+    }
 }
 
 impl From<hyper::Error> for Error {
@@ -50,7 +52,7 @@ impl From<tower_grpc::Status> for Error {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct Outpoint {
     pub hash: Vec<u8>,
     pub index: u32,
@@ -71,8 +73,7 @@ pub enum EffectKind {
     Credit,
 }
 
-
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct Effect {
     pub amount: u64,
     pub target: Outpoint,
@@ -91,20 +92,31 @@ fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
             if let Some(outpoint) = input.previous_output {
                 let utxo = Outpoint::from(outpoint);
                 if let Some(value) = wallet.owned_tx.get(&utxo) {
-                    affect.push(Effect{kind: EffectKind::Spend,target: utxo,amount: *value});
+                    affect.push(Effect {
+                        kind: EffectKind::Spend,
+                        target: utxo,
+                        amount: *value,
+                    });
                 }
             }
         }
-        for (output_index, output) in tx.outputs.into_iter().enumerate() {  
+        for (output_index, output) in tx.outputs.into_iter().enumerate() {
             let value = output.value;
             let mut de = Deserializer::new(bytes::BytesMut::from(output.script));
             match Vec::<OP>::deserialize(&mut de) {
                 Ok(v) => {
                     if v == script {
-                        affect.push(Effect{kind: EffectKind::Credit, target: Outpoint{hash: hash.clone(), index: output_index as u32}, amount: value});
+                        affect.push(Effect {
+                            kind: EffectKind::Credit,
+                            target: Outpoint {
+                                hash: hash.clone(),
+                                index: output_index as u32,
+                            },
+                            amount: value,
+                        });
                     }
                 }
-                Err(e) => warn!("Invalid script in tx: {:?}",e)
+                Err(e) => warn!("Invalid script in tx: {:?}", e),
             };
         }
     }
@@ -113,9 +125,33 @@ fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
 
 pub struct Wallet {
     pub owned_tx: HashMap<Outpoint, u64>,
-    pub pub_key: PubKey,
+    pub pub_key: PublicKey,
+    secret_key: SecretKey,
     pub_key_hash_code: Vec<OP>,
     stack: Vec<Point>,
+}
+
+impl Wallet {
+    pub fn with_random_key() -> Data {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let (secret_key, pub_key) = secp.generate_keypair(&mut rng);
+        let pub_key_hash_code = pub_key
+            .serialize()
+            .into_iter()
+            .map(|b| OP::Byte(*b))
+            .collect();
+        Arc::new(RwLock::new(Self {
+            secret_key,
+            pub_key,
+            pub_key_hash_code,
+            owned_tx: HashMap::new(),
+            stack: Vec::new(),
+        }))
+    }
+    pub fn balance(&self) -> u64 {
+        self.owned_tx.values().sum()
+    }
 }
 
 struct Point {
@@ -127,17 +163,38 @@ struct Point {
 
 type Data = Arc<RwLock<Wallet>>;
 
-pub async fn update_balance(uri: http::Uri, wallet: Data) -> Result<(), Error> {
+pub fn for_balance_udpate<F, U>(
+    uri: http::Uri,
+    wallet: Data,
+    update: F,
+) -> impl Future<Item = (), Error = Error>
+where
+    F: FnMut(u64) -> U,
+    U: futures::IntoFuture<Item = (), Error = Error>,
+{
+    futures_new::compat::Compat::new(Box::pin(balance_updater(uri, wallet)))
+        .and_then(|stream| stream.for_each(update))
+}
+
+async fn balance_updater(
+    uri: http::Uri,
+    wallet: Data,
+) -> Result<impl Stream<Item = u64, Error = Error>, Error> {
     let stream = following_txs(uri, wallet.clone()).await?;
-    futures_new::compat::Compat01As03::new(stream.for_each(|point| {
+    let return_stream = stream.map(move |point| {
         let mut wallet = wallet.write();
         let last_valid = loop {
             match wallet.stack.pop() {
-            Some(stack_point) => {
+                Some(stack_point) => {
                     if stack_point.hash == point.previous_hash {
                         break Some(stack_point);
                     } else {
-                        for Effect{amount, target, kind} in stack_point.effects {
+                        for Effect {
+                            amount,
+                            target,
+                            kind,
+                        } in stack_point.effects
+                        {
                             match kind {
                                 EffectKind::Credit => {
                                     wallet.owned_tx.remove(&target);
@@ -149,19 +206,32 @@ pub async fn update_balance(uri: http::Uri, wallet: Data) -> Result<(), Error> {
                         }
                     }
                 }
-                None => break None
+                None => break None,
             }
         };
         if let Some(last_valid) = last_valid {
             wallet.stack.push(last_valid)
         }
+        for effect in &point.effects {
+            match effect.kind {
+                EffectKind::Credit => {
+                    wallet.owned_tx.insert(effect.target.clone(), effect.amount);
+                }
+                EffectKind::Spend => {
+                    wallet.owned_tx.remove(&effect.target);
+                }
+            }
+        }
         wallet.stack.push(point);
-        Ok(())
-    })).await?;
-    Ok(())
+        wallet.balance()
+    });
+    Ok(return_stream)
 }
 
-async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< Item = Point, Error = Error>, Error> {
+async fn following_txs(
+    uri: http::Uri,
+    wallet: Data,
+) -> Result<impl Stream<Item = Point, Error = Error>, Error> {
     let dst = Destination::try_from_uri(uri.clone())?;
     let connector = util::Connector::new(HttpConnector::new(4));
     let settings = client::Builder::new().http2_only(true).clone();
@@ -196,12 +266,22 @@ async fn following_txs(uri: http::Uri, wallet: Data) -> Result<impl Stream< Item
                     hash: response.hash,
                 }))
                 .map_err(Error::from)
-        }).map(|reply| reply.into_inner())
+        })
+        .map(|reply| reply.into_inner())
         .map(move |reply| match reply.block {
-            Some(block) => Point{height: block.height as u64,hash: block.hash, previous_hash: block.prev_block,effects: affecting_tx(block.txs, wallet.clone())},
-            None => Point{height:0, effects: Vec::new(), hash: Vec::new(), previous_hash: Vec::new()},
-        }).filter(
-            |p| !p.effects.is_empty()
-        );
+            Some(block) => Point {
+                height: block.height as u64,
+                hash: block.hash,
+                previous_hash: block.prev_block,
+                effects: affecting_tx(block.txs, wallet.clone()),
+            },
+            None => Point {
+                height: 0,
+                effects: Vec::new(),
+                hash: Vec::new(),
+                previous_hash: Vec::new(),
+            },
+        })
+        .filter(|p| !p.effects.is_empty());
     Ok(response_stream)
 }
