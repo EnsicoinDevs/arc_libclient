@@ -10,9 +10,9 @@ license = "MIT"
 
 [dependencies]
 tower-grpc = "0.1.0"
-futures = {version = "0.1.28"}
+futures = "0.1.29"
 futures_new = {version = "0.3.0-alpha.18", features = ["compat"], package="futures-preview"}
-hyper = "0.12.33"
+hyper = "0.12.34"
 tokio = "0.1.22"
 tower-hyper = "0.1.1"
 tower-util = "0.1.0"
@@ -23,11 +23,15 @@ http = "0.1.18"
 log = "0.4.8"
 tower-request-modifier = "0.1.0"
 parking_lot = "0.9.0"
-ensicoin_messages = { path = "../ensicoin-message", features = ["grpc"]}
-ensicoin_serializer = "2.0.7"
+ensicoin_messages = "0.7.4"
+ensicoin_serializer = "2.0.9"
 secp256k1 = { version = "0.15.5", features = ["rand", "serde"] }
 ripemd160 = "0.8.0"
 rand = "0.6.0"
+serde = { version = "1.0.100", features = ["derive"] }
+sodiumoxide = "0.2.4"
+base64 = "0.10.1"
+ron = "0.5.1"
 
 [build-dependencies]
 tower-grpc-build = "0.1.0"

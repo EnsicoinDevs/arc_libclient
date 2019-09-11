@@ -6,9 +6,11 @@ use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
 
-use ensicoin_messages::resource::script::OP;
+use ensicoin_messages::resource::script::{OP, Script};
 use ensicoin_serializer::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
+use sodiumoxide::crypto::secretbox;
+use std::io::prelude::*;
 
 #[macro_use]
 extern crate log;
@@ -52,7 +54,7 @@ impl From<tower_grpc::Status> for Error {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Outpoint {
     pub hash: Vec<u8>,
     pub index: u32,
@@ -67,13 +69,13 @@ impl From<node::Outpoint> for Outpoint {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Copy, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
     Spend,
     Credit,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Effect {
     pub amount: u64,
     pub target: Outpoint,
@@ -83,9 +85,10 @@ pub struct Effect {
 fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
     let wallet = wallet.read();
     let mut affect = Vec::new();
-    let mut script = vec![OP::Dup, OP::Hash160];
+    let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];
     script.extend_from_slice(&wallet.pub_key_hash_code);
     script.append(&mut vec![OP::Equal, OP::Verify, OP::Checksig]);
+    let script = Script::from(script);
     for tx in response {
         let hash = tx.hash;
         for input in tx.inputs {
@@ -103,7 +106,7 @@ fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
         for (output_index, output) in tx.outputs.into_iter().enumerate() {
             let value = output.value;
             let mut de = Deserializer::new(bytes::BytesMut::from(output.script));
-            match Vec::<OP>::deserialize(&mut de) {
+            match Script::deserialize(&mut de) {
                 Ok(v) => {
                     if v == script {
                         affect.push(Effect {
@@ -129,31 +132,127 @@ pub struct Wallet {
     secret_key: SecretKey,
     pub_key_hash_code: Vec<OP>,
     stack: Vec<Point>,
+
+    max_height: u64,
+    max_block: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletStorage {
+    owned_tx: HashMap<Outpoint, u64>,
+    pub_key: PublicKey,
+    secret_key: SecretKey,
+    stack: Vec<Point>,
+
+    max_height: u64,
+    max_block: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskStorage {
+    nonce: secretbox::Nonce,
+    #[serde(deserialize_with = "from_base64", serialize_with = "as_base64")]
+    cipher: Vec<u8>,
+}
+
+fn as_base64<T, S>(key: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where T: AsRef<[u8]>,
+          S: serde::Serializer
+{
+    serializer.serialize_str(&base64::encode(key.as_ref()))
+}
+
+fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where D: serde::Deserializer<'de>
+{
+    use serde::de::Error as DeError;
+    <String as serde::Deserialize>::deserialize(deserializer)
+        .and_then(|string| base64::decode(&string).map_err(|err| DeError::custom(err.to_string())))
+}
+
+impl WalletStorage {
+    fn create_disk_storage(&self) -> Result<(DiskStorage, secretbox::Key), ron::ser::Error> {
+        let key = secretbox::gen_key();
+        let nonce = secretbox::gen_nonce();
+        let serialized = ron::ser::to_string(self)?;
+        let cipher = secretbox::seal(serialized.as_bytes(), &nonce, &key);
+        Ok((DiskStorage{nonce, cipher}, key))
+    }
+}
+
+#[derive(Debug)]
+pub enum StorageError {
+    IoError(std::io::Error),
+    SerError(ron::ser::Error),
+    DeError(ron::de::Error),
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(err)
+    }
+}
+impl From<ron::ser::Error> for StorageError {
+    fn from(err: ron::ser::Error) -> Self {
+        Self::SerError(err)
+    }
+}
+impl From<ron::de::Error> for StorageError {
+    fn from(err: ron::de::Error) -> Self {
+        Self::DeError(err)
+    }
 }
 
 impl Wallet {
-    pub fn with_random_key() -> Data {
+    pub fn with_random_key<P>(path: P) -> Result<(Data, secretbox::Key), StorageError> where P: AsRef<std::path::Path>{
         let secp = Secp256k1::new();
+
         let mut rng = rand::thread_rng();
         let (secret_key, pub_key) = secp.generate_keypair(&mut rng);
-        let pub_key_hash_code = pub_key
-            .serialize()
+
+        use ripemd160::{Ripemd160, Digest};
+        let mut hasher = Ripemd160::new();
+        hasher.input(&pub_key.serialize()[..]);
+        let pub_key_hash_code = hasher.result()
             .into_iter()
-            .map(|b| OP::Byte(*b))
+            .map(|b| OP::Byte(b))
             .collect();
-        Arc::new(RwLock::new(Self {
+        // TODO: Not forget on load
+        sodiumoxide::init().expect("Crypto creation");
+
+        let wallet = Self {
             secret_key,
             pub_key,
             pub_key_hash_code,
             owned_tx: HashMap::new(),
             stack: Vec::new(),
-        }))
+            max_block: Vec::new(),
+            max_height: 0,
+        };
+        let (storage, key) = wallet.as_storage().create_disk_storage()?;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        let storage = ron::ser::to_string(&storage)?;
+        file.write_all(storage.as_bytes())?;
+        Ok((Arc::new(RwLock::new(wallet)), key))
     }
     pub fn balance(&self) -> u64 {
         self.owned_tx.values().sum()
     }
+    fn as_storage(&self) -> WalletStorage {
+        WalletStorage {
+            secret_key: self.secret_key.clone(),
+            pub_key: self.pub_key.clone(),
+
+            owned_tx: self.owned_tx.clone(),
+            stack: self.stack.clone(),
+
+            max_height: self.max_height.clone(),
+            max_block: self.max_block.clone(),
+        }
+    }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct Point {
     pub height: u64,
     pub hash: Vec<u8>,
@@ -222,6 +321,8 @@ async fn balance_updater(
                 }
             }
         }
+        wallet.max_height = point.height;
+        wallet.max_block = point.hash.clone();
         wallet.stack.push(point);
         wallet.balance()
     });
