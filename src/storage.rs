@@ -32,6 +32,39 @@ impl Wallet {
         self.max_height = height;
         self.max_block = hash;
     }
+    fn open<P>(path: P, key: &secretbox::Key) -> Result<Wallet, StorageError>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let mut file = std::fs::File::open(path)?;
+        let storage: DiskStorage = ron::de::from_reader(&mut file)?;
+        let storage = WalletStorage::open_storage(storage, key)?;
+
+        use ripemd160::{Digest, Ripemd160};
+        let mut hasher = Ripemd160::new();
+        hasher.input(&storage.pub_key.serialize()[..]);
+        let pub_key_hash_code = hasher.result().into_iter().map(|b| OP::Byte(b)).collect();
+
+        Ok(Self {
+            owned_tx: storage.owned_tx,
+            stack: storage.stack,
+
+            pub_key: storage.pub_key,
+            secret_key: storage.secret_key,
+            pub_key_hash_code,
+
+            max_block: storage.max_block,
+            max_height: storage.max_height,
+        })
+    }
+    pub fn restore<P>(path: P, key: &secretbox::Key, uri: http::Uri) -> Result<Data, StorageError>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let wallet = Wallet::open(path, key)?;
+        //TODO
+        unimplemented!()
+    }
     pub fn with_random_key<P>(path: P) -> Result<(Data, secretbox::Key), StorageError>
     where
         P: AsRef<std::path::Path>,
@@ -126,6 +159,12 @@ impl WalletStorage {
         let cipher = secretbox::seal(serialized.as_bytes(), &nonce, &key);
         Ok((DiskStorage { nonce, cipher }, key))
     }
+    fn open_storage(storage: DiskStorage, key: &secretbox::Key) -> Result<Self, StorageError> {
+        let storage = secretbox::open(&storage.cipher, &storage.nonce, &key)
+            .map_err(|_| StorageError::DecryptError)?;
+        let storage = ron::de::from_bytes(&storage)?;
+        Ok(storage)
+    }
 }
 
 #[derive(Debug)]
@@ -133,6 +172,7 @@ pub enum StorageError {
     IoError(std::io::Error),
     SerError(ron::ser::Error),
     DeError(ron::de::Error),
+    DecryptError,
 }
 
 impl From<std::io::Error> for StorageError {
