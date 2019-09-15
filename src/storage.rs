@@ -1,38 +1,14 @@
 use super::{Data, Outpoint, Point};
 use ensicoin_messages::resource::script::OP;
-use parking_lot::RwLock;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sodiumoxide::crypto::secretbox;
-use std::collections::{HashMap, HashSet};
-use std::io::prelude::*;
-use std::sync::Arc;
+use std::{collections::HashMap, io::prelude::*, sync::Arc};
 
-pub struct Wallet {
-    pub owned_tx: HashMap<Outpoint, u64>,
-    pub pub_key: PublicKey,
-    secret_key: SecretKey,
-    pub_key_hash_code: Vec<OP>,
-    stack: Vec<Point>,
-
-    max_height: u64,
-    max_block: Vec<u8>,
-}
+use super::Wallet;
+use parking_lot::RwLock;
 
 impl Wallet {
-    pub(crate) fn pop_stack(&mut self) -> Option<Point> {
-        self.stack.pop()
-    }
-    pub(crate) fn push_stack(&mut self, point: Point) {
-        self.stack.push(point)
-    }
-    pub(crate) fn get_op_hash(&self) -> &[OP] {
-        &self.pub_key_hash_code
-    }
-    pub(crate) fn set_max(&mut self, height: u64, hash: Vec<u8>) {
-        self.max_height = height;
-        self.max_block = hash;
-    }
-    fn open<P>(path: P, key: &secretbox::Key) -> Result<Wallet, StorageError>
+    pub fn open<P>(path: P, key: &secretbox::Key) -> Result<Wallet, StorageError>
     where
         P: AsRef<std::path::Path>,
     {
@@ -52,18 +28,7 @@ impl Wallet {
             pub_key: storage.pub_key,
             secret_key: storage.secret_key,
             pub_key_hash_code,
-
-            max_block: storage.max_block,
-            max_height: storage.max_height,
         })
-    }
-    pub fn restore<P>(path: P, key: &secretbox::Key, uri: http::Uri) -> Result<Data, StorageError>
-    where
-        P: AsRef<std::path::Path>,
-    {
-        let wallet = Wallet::open(path, key)?;
-        //TODO
-        unimplemented!()
     }
     pub fn with_random_key<P>(path: P) -> Result<(Data, secretbox::Key), StorageError>
     where
@@ -87,8 +52,6 @@ impl Wallet {
             pub_key_hash_code,
             owned_tx: HashMap::new(),
             stack: Vec::new(),
-            max_block: Vec::new(),
-            max_height: 0,
         };
         let (storage, key) = wallet.as_storage().create_disk_storage()?;
         let mut file = std::fs::OpenOptions::new()
@@ -109,9 +72,6 @@ impl Wallet {
 
             owned_tx: self.owned_tx.clone(),
             stack: self.stack.clone(),
-
-            max_height: self.max_height.clone(),
-            max_block: self.max_block.clone(),
         }
     }
 }
@@ -122,9 +82,6 @@ struct WalletStorage {
     pub_key: PublicKey,
     secret_key: SecretKey,
     stack: Vec<Point>,
-
-    max_height: u64,
-    max_block: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -6,10 +6,9 @@ use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
 
-use ensicoin_messages::resource::script::{OP, Script};
-use ensicoin_serializer::{Deserialize, Deserializer, Serialize};
 mod storage;
-pub use storage::Wallet;
+mod wallet;
+pub use wallet::Wallet;
 
 #[macro_use]
 extern crate log;
@@ -26,6 +25,13 @@ pub enum Error {
     TransportError(hyper::Error),
     ConnectError(tower_hyper::client::ConnectError<std::io::Error>),
     ChannelError,
+    Storage(storage::StorageError),
+}
+
+impl From<storage::StorageError> for Error {
+    fn from(err: storage::StorageError) -> Self {
+        Self::Storage(err)
+    }
 }
 
 impl From<tokio::sync::mpsc::error::SendError> for Error {
@@ -80,53 +86,10 @@ pub struct Effect {
     pub kind: EffectKind,
 }
 
-fn affecting_tx(response: Vec<Tx>, wallet: Data) -> Vec<Effect> {
-    let wallet = wallet.read();
-    let mut affect = Vec::new();
-    let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];
-    script.extend_from_slice(&wallet.get_op_hash());
-    script.append(&mut vec![OP::Equal, OP::Verify, OP::Checksig]);
-    let script = Script::from(script);
-    for tx in response {
-        let hash = tx.hash;
-        for input in tx.inputs {
-            if let Some(outpoint) = input.previous_output {
-                let utxo = Outpoint::from(outpoint);
-                if let Some(value) = wallet.owned_tx.get(&utxo) {
-                    affect.push(Effect {
-                        kind: EffectKind::Spend,
-                        target: utxo,
-                        amount: *value,
-                    });
-                }
-            }
-        }
-        for (output_index, output) in tx.outputs.into_iter().enumerate() {
-            let value = output.value;
-            let mut de = Deserializer::new(bytes::BytesMut::from(output.script));
-            match Script::deserialize(&mut de) {
-                Ok(v) => {
-                    if v == script {
-                        affect.push(Effect {
-                            kind: EffectKind::Credit,
-                            target: Outpoint {
-                                hash: hash.clone(),
-                                index: output_index as u32,
-                            },
-                            amount: value,
-                        });
-                    }
-                }
-                Err(e) => warn!("Invalid script in tx: {:?}", e),
-            };
-        }
-    }
-    affect
-}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct Point {
-    pub height: u64,
+    pub height: u32,
     pub hash: Vec<u8>,
     pub previous_hash: Vec<u8>,
     pub effects: Vec<Effect>,
@@ -151,53 +114,22 @@ async fn balance_updater(
     uri: http::Uri,
     wallet: Data,
 ) -> Result<impl Stream<Item = u64, Error = Error>, Error> {
-    let stream = following_txs(uri, wallet.clone()).await?;
+    let stream = following_txs(uri.clone(), wallet.clone()).await?;
     let return_stream = stream.map(move |point| {
-        let mut wallet = wallet.write();
-        let last_valid = loop {
-            match wallet.pop_stack() {
-                Some(stack_point) => {
-                    if stack_point.hash == point.previous_hash {
-                        break Some(stack_point);
-                    } else {
-                        for Effect {
-                            amount,
-                            target,
-                            kind,
-                        } in stack_point.effects
-                        {
-                            match kind {
-                                EffectKind::Credit => {
-                                    wallet.owned_tx.remove(&target);
-                                }
-                                EffectKind::Spend => {
-                                    wallet.owned_tx.insert(target, amount);
-                                }
-                            }
-                        }
-                    }
-                }
-                None => break None,
-            }
-        };
-        if let Some(last_valid) = last_valid {
-            wallet.push_stack(last_valid)
-        }
-        for effect in &point.effects {
-            match effect.kind {
-                EffectKind::Credit => {
-                    wallet.owned_tx.insert(effect.target.clone(), effect.amount);
-                }
-                EffectKind::Spend => {
-                    wallet.owned_tx.remove(&effect.target);
-                }
+        {
+            let mut wallet_guard = wallet.write();
+            while point.height < wallet_guard.height() as u32 {
+                wallet_guard.pop();
             }
         }
-        wallet.set_max(point.height, point.hash.clone());
-        wallet.push_stack(point);
-        wallet.balance()
-    });
+        (wallet.clone(), point)
+    }).and_then(move |(wallet, point)| futures_new::compat::Compat::new(Box::pin(fork_wallet(uri.clone(), wallet, point))));
     Ok(return_stream)
+}
+
+async fn fork_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, Error> {
+    let balance = wallet.read().balance();
+    Ok(balance)
 }
 
 async fn following_txs(
@@ -242,10 +174,10 @@ async fn following_txs(
         .map(|reply| reply.into_inner())
         .map(move |reply| match reply.block {
             Some(block) => Point {
-                height: block.height as u64,
+                height: block.height as u32,
                 hash: block.hash,
                 previous_hash: block.prev_block,
-                effects: affecting_tx(block.txs, wallet.clone()),
+                effects: wallet.write().affects(block.txs),
             },
             None => Point {
                 height: 0,
@@ -253,7 +185,6 @@ async fn following_txs(
                 hash: Vec::new(),
                 previous_hash: Vec::new(),
             },
-        })
-        .filter(|p| !p.effects.is_empty());
+        });
     Ok(response_stream)
 }
