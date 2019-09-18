@@ -13,8 +13,9 @@ impl Wallet {
         P: AsRef<std::path::Path>,
     {
         let mut file = std::fs::File::open(path)?;
-        let storage: DiskStorage = ron::de::from_reader(&mut file)?;
+        let storage: DiskStorage = serde_json::from_reader(&mut file)?;
         let key = secretbox::Key::from_slice(key).ok_or(StorageError::InvalidKey)?;
+        let nonce = storage.nonce.clone();
         let storage = WalletStorage::open_storage(storage, &key)?;
 
         use ripemd160::{Digest, Ripemd160};
@@ -23,7 +24,8 @@ impl Wallet {
         let pub_key_hash_code = hasher.result().into_iter().map(|b| OP::Byte(b)).collect();
 
         Ok(Arc::new(RwLock::new(Self {
-            owned_tx: storage.owned_tx,
+            nonce,
+            owned_tx: storage.decode_txs()?,
             stack: storage.stack,
 
             pub_key: storage.pub_key,
@@ -31,7 +33,7 @@ impl Wallet {
             pub_key_hash_code,
         })))
     }
-    pub fn with_random_key<P>(path: P) -> Result<(Data, secretbox::Key), StorageError>
+    pub fn with_random_key<P>(path: P) -> Result<(Data, Vec<u8>), StorageError>
     where
         P: AsRef<std::path::Path>,
     {
@@ -47,39 +49,51 @@ impl Wallet {
         // TODO: Not forget on load
         sodiumoxide::init().expect("Crypto creation");
 
+        let (key, nonce) = DiskStorage::create_crypto();
         let wallet = Self {
+            nonce: nonce.clone(),
             secret_key,
             pub_key,
             pub_key_hash_code,
             owned_tx: HashMap::new(),
             stack: Vec::new(),
         };
-        let (storage, key) = wallet.as_storage().create_disk_storage()?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        let storage = ron::ser::to_string(&storage)?;
+        std::fs::File::create(&path).map_err(StorageError::CreationError)?;
+        wallet.save(path, key.as_ref())?;
+        Ok((Arc::new(RwLock::new(wallet)), key.as_ref().to_vec()))
+    }
+    pub fn save<P>(&self, path: P, key: &[u8]) -> Result<(), StorageError>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let key = secretbox::Key::from_slice(key).ok_or(StorageError::InvalidKey)?;
+        let storage = self.as_storage()?.seal(&key, self.nonce.clone())?;
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        let storage = serde_json::ser::to_string(&storage)?;
         file.write_all(storage.as_bytes())?;
-        Ok((Arc::new(RwLock::new(wallet)), key))
+        Ok(())
     }
     pub fn balance(&self) -> u64 {
         self.owned_tx.values().sum()
     }
-    fn as_storage(&self) -> WalletStorage {
-        WalletStorage {
+    fn as_storage(&self) -> Result<WalletStorage, serde_json::Error> {
+        let mut owned_serialized = HashMap::new();
+        for (utxo, amount) in &self.owned_tx {
+            owned_serialized.insert(serde_json::to_string(utxo)?, *amount);
+        }
+        Ok(WalletStorage {
             secret_key: self.secret_key.clone(),
             pub_key: self.pub_key.clone(),
 
-            owned_tx: self.owned_tx.clone(),
+            owned_tx: owned_serialized,
             stack: self.stack.clone(),
-        }
+        })
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WalletStorage {
-    owned_tx: HashMap<Outpoint, u64>,
+    owned_tx: HashMap<String, u64>,
     pub_key: PublicKey,
     secret_key: SecretKey,
     stack: Vec<Point>,
@@ -110,28 +124,43 @@ where
 }
 
 impl WalletStorage {
-    fn create_disk_storage(&self) -> Result<(DiskStorage, secretbox::Key), ron::ser::Error> {
-        let key = secretbox::gen_key();
-        let nonce = secretbox::gen_nonce();
-        let serialized = ron::ser::to_string(self)?;
+    fn seal(
+        &self,
+        key: &secretbox::Key,
+        nonce: secretbox::Nonce,
+    ) -> Result<DiskStorage, serde_json::Error> {
+        let serialized = serde_json::to_string(self)?;
         let cipher = secretbox::seal(serialized.as_bytes(), &nonce, &key);
-        Ok((DiskStorage { nonce, cipher }, key))
+        Ok(DiskStorage { nonce, cipher })
     }
     fn open_storage(storage: DiskStorage, key: &secretbox::Key) -> Result<Self, StorageError> {
         let storage = secretbox::open(&storage.cipher, &storage.nonce, &key)
             .map_err(|_| StorageError::DecryptError)?;
-        let storage = ron::de::from_bytes(&storage)?;
+        let storage = serde_json::from_slice(&storage)?;
         Ok(storage)
+    }
+    fn decode_txs(&self) -> Result<HashMap<Outpoint, u64>, StorageError> {
+        let mut res = HashMap::new();
+        for (ser_data, amount) in &self.owned_tx {
+            res.insert(serde_json::from_str(ser_data)?, *amount);
+        }
+        Ok(res)
+    }
+}
+
+impl DiskStorage {
+    fn create_crypto() -> (secretbox::Key, secretbox::Nonce) {
+        (secretbox::gen_key(), secretbox::gen_nonce())
     }
 }
 
 #[derive(Debug)]
 pub enum StorageError {
     IoError(std::io::Error),
-    SerError(ron::ser::Error),
-    DeError(ron::de::Error),
+    SerDeError(serde_json::Error),
     DecryptError,
     InvalidKey,
+    CreationError(std::io::Error),
 }
 
 impl From<std::io::Error> for StorageError {
@@ -139,13 +168,8 @@ impl From<std::io::Error> for StorageError {
         Self::IoError(err)
     }
 }
-impl From<ron::ser::Error> for StorageError {
-    fn from(err: ron::ser::Error) -> Self {
-        Self::SerError(err)
-    }
-}
-impl From<ron::de::Error> for StorageError {
-    fn from(err: ron::de::Error) -> Self {
-        Self::DeError(err)
+impl From<serde_json::Error> for StorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::SerDeError(err)
     }
 }

@@ -31,7 +31,8 @@ rand = "0.6.0"
 serde = { version = "1.0.100", features = ["derive"] }
 sodiumoxide = "0.2.4"
 base64 = "0.10.1"
-ron = "0.5.1"
+serde_json = "1.0.40"
+#ron = "0.5.1"
 
 [build-dependencies]
 tower-grpc-build = "0.1.0"

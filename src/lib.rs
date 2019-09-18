@@ -190,8 +190,10 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
         wallet.write().pop();
     }
     {
+        debug!("Top hash is {:?}", wallet.read().top_hash().map(base64::encode));
         let mut wallet_guard = wallet.write();
         while let Some(point) = last_point.pop() {
+            debug!("Writing {}", base64::encode(&point.hash));
             wallet_guard.push_point(point)?;
         }
     }

@@ -17,6 +17,8 @@ pub struct Wallet {
     pub(crate) pub_key_hash_code: Vec<OP>,
 
     pub(crate) stack: Vec<Point>,
+
+    pub(crate) nonce: sodiumoxide::crypto::secretbox::Nonce,
 }
 
 impl Wallet {
@@ -103,7 +105,7 @@ impl Wallet {
         }
     }
     fn is_next_point(&self, height: u32, prev_hash: &[u8]) -> bool {
-        (self.stack.is_empty() && height == 0)
+        (self.stack.is_empty() && height == 1)
             || (!self.stack.is_empty()
                 && (self.stack.len() + 1 == height as usize
                     && self.stack.last().unwrap().hash == prev_hash))
