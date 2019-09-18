@@ -109,7 +109,7 @@ impl Wallet {
                     && self.stack.last().unwrap().hash == prev_hash))
     }
     #[inline]
-    pub fn is_next_block(&self, block: &super::Block) -> bool {
+    pub fn is_next_block(&self, block: &super::node::BlockHeader) -> bool {
         self.is_next_point(block.height, &block.prev_block)
     }
     #[inline]
@@ -117,13 +117,11 @@ impl Wallet {
         self.stack.is_empty()
     }
     #[inline]
-    pub fn last_known(&self) -> Option<(usize, &[u8])> {
-        self.stack
-            .last()
-            .map(|p| (self.stack.len(), p.hash.as_ref()))
-    }
-    #[inline]
     pub fn height(&self) -> usize {
         self.stack.len()
+    }
+    #[inline]
+    pub fn top_hash(&self) -> Option<&[u8]> {
+        self.stack.last().map(|p| p.hash.as_ref())
     }
 }

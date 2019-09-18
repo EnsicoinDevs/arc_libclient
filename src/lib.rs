@@ -26,6 +26,15 @@ pub enum Error {
     ConnectError(tower_hyper::client::ConnectError<std::io::Error>),
     ChannelError,
     Storage(storage::StorageError),
+    MissingHeader,
+    MissingBlock,
+    PushedWrongPoint(wallet::PushError),
+}
+
+impl From<wallet::PushError> for Error {
+    fn from(err: wallet::PushError) -> Self {
+        Self::PushedWrongPoint(err)
+    }
 }
 
 impl From<storage::StorageError> for Error {
@@ -86,7 +95,6 @@ pub struct Effect {
     pub kind: EffectKind,
 }
 
-
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct Point {
     pub height: u32,
@@ -115,19 +123,78 @@ async fn balance_updater(
     wallet: Data,
 ) -> Result<impl Stream<Item = u64, Error = Error>, Error> {
     let stream = following_txs(uri.clone(), wallet.clone()).await?;
-    let return_stream = stream.map(move |point| {
-        {
-            let mut wallet_guard = wallet.write();
-            while point.height < wallet_guard.height() as u32 {
-                wallet_guard.pop();
+    let return_stream = stream
+        .map(move |point| {
+            {
+                let mut wallet_guard = wallet.write();
+                while point.height < wallet_guard.height() as u32 {
+                    wallet_guard.pop();
+                }
             }
-        }
-        (wallet.clone(), point)
-    }).and_then(move |(wallet, point)| futures_new::compat::Compat::new(Box::pin(fork_wallet(uri.clone(), wallet, point))));
+            (wallet.clone(), point)
+        })
+        .and_then(move |(wallet, point)| {
+            futures_new::compat::Compat::new(Box::pin(push_wallet(uri.clone(), wallet, point)))
+        });
     Ok(return_stream)
 }
 
-async fn fork_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, Error> {
+async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, Error> {
+    let dst = Destination::try_from_uri(uri.clone())?;
+    let connector = util::Connector::new(HttpConnector::new(4));
+    let settings = client::Builder::new().http2_only(true).clone();
+    let mut make_client = client::Connect::with_builder(connector, settings);
+
+    // This needs to be done better, the proble is that I don't know type inference enough
+    let (_, mut client) = futures_new::compat::Compat01As03::new(
+        make_client
+            .make_service(dst)
+            .map_err(Error::from)
+            .and_then(move |conn| {
+                use node::client::Node;
+                let conn = tower_request_modifier::Builder::new()
+                    .set_origin(uri)
+                    .build(conn)
+                    .unwrap();
+
+                Node::new(conn).ready().map_err(Error::from)
+            })
+            .and_then(|mut client| {
+                client
+                    .get_info(Request::new(node::GetInfoRequest {}))
+                    .map_err(Error::from)
+                    .map(move |response| (response, client))
+            }),
+    )
+    .await?;
+    let mut last_point = vec![point];
+    while wallet.read().height() > 0
+        && last_point.last().unwrap().previous_hash != wallet.read().top_hash().unwrap()
+    {
+        let block = match futures_new::compat::Compat01As03::new(client.get_block_by_hash(
+            Request::new(node::GetBlockByHashRequest {
+                hash: last_point.last().unwrap().previous_hash.clone(),
+            }),
+        ))
+        .await?
+        .into_inner().block {
+            Some(b) => b,
+            None => return Err(Error::MissingBlock),
+        };
+        let header = match block.header {
+            Some(h) => h,
+            None => return Err(Error::MissingHeader),
+        };
+        let effects = wallet.read().affects(block.txs);
+        last_point.push(Point{previous_hash: header.prev_block, hash: header.hash, effects, height: header.height});
+        wallet.write().pop();
+    }
+    {
+        let mut wallet_guard = wallet.write();
+        while let Some(point) = last_point.pop() {
+            wallet_guard.push_point(point)?;
+        }
+    }
     let balance = wallet.read().balance();
     Ok(balance)
 }
@@ -172,14 +239,14 @@ async fn following_txs(
                 .map_err(Error::from)
         })
         .map(|reply| reply.into_inner())
-        .map(move |reply| match reply.block {
-            Some(block) => Point {
+        .map(move |reply| match reply.block.map(|b| (b.header, b.txs)) {
+            Some((Some(block), txs)) => Point {
                 height: block.height as u32,
                 hash: block.hash,
                 previous_hash: block.prev_block,
-                effects: wallet.write().affects(block.txs),
+                effects: wallet.write().affects(txs),
             },
-            None => Point {
+            _ => Point {
                 height: 0,
                 effects: Vec::new(),
                 hash: Vec::new(),
