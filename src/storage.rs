@@ -8,13 +8,14 @@ use super::Wallet;
 use parking_lot::RwLock;
 
 impl Wallet {
-    pub fn open<P>(path: P, key: &secretbox::Key) -> Result<Wallet, StorageError>
+    pub fn open<P>(path: P, key: &[u8]) -> Result<Wallet, StorageError>
     where
         P: AsRef<std::path::Path>,
     {
         let mut file = std::fs::File::open(path)?;
         let storage: DiskStorage = ron::de::from_reader(&mut file)?;
-        let storage = WalletStorage::open_storage(storage, key)?;
+        let key = secretbox::Key::from_slice(key).ok_or(StorageError::InvalidKey)?;
+        let storage = WalletStorage::open_storage(storage, &key)?;
 
         use ripemd160::{Digest, Ripemd160};
         let mut hasher = Ripemd160::new();
@@ -130,6 +131,7 @@ pub enum StorageError {
     SerError(ron::ser::Error),
     DeError(ron::de::Error),
     DecryptError,
+    InvalidKey,
 }
 
 impl From<std::io::Error> for StorageError {
