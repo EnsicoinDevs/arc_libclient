@@ -8,7 +8,7 @@ use super::Wallet;
 use parking_lot::RwLock;
 
 impl Wallet {
-    pub fn open<P>(path: P, key: &[u8]) -> Result<Wallet, StorageError>
+    pub fn open<P>(path: P, key: &[u8]) -> Result<Data, StorageError>
     where
         P: AsRef<std::path::Path>,
     {
@@ -22,14 +22,14 @@ impl Wallet {
         hasher.input(&storage.pub_key.serialize()[..]);
         let pub_key_hash_code = hasher.result().into_iter().map(|b| OP::Byte(b)).collect();
 
-        Ok(Self {
+        Ok(Arc::new(RwLock::new(Self {
             owned_tx: storage.owned_tx,
             stack: storage.stack,
 
             pub_key: storage.pub_key,
             secret_key: storage.secret_key,
             pub_key_hash_code,
-        })
+        })))
     }
     pub fn with_random_key<P>(path: P) -> Result<(Data, secretbox::Key), StorageError>
     where
