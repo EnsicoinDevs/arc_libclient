@@ -133,7 +133,7 @@ impl Wallet {
     }
 
     pub fn pop(&mut self) {
-        if !self.stack.is_empty() {
+        if self.stack.len() > 1 {
             for effect in self.stack.pop().unwrap().effects {
                 self.undo_effect(effect);
             }
@@ -151,10 +151,7 @@ impl Wallet {
         }
     }
     fn is_next_point(&self, height: u32, prev_hash: &[u8]) -> bool {
-        (self.stack.is_empty() && height == 1)
-            || (!self.stack.is_empty()
-                && (self.stack.len() + 1 == height as usize
-                    && self.stack.last().unwrap().hash == prev_hash))
+        self.stack.len() == height as usize && self.stack.last().unwrap().hash == prev_hash
     }
     #[inline]
     pub fn is_next_block(&self, block: &super::node::BlockHeader) -> bool {
