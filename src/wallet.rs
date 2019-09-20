@@ -1,8 +1,14 @@
-use super::{Effect, EffectKind, Outpoint, Point};
+use super::{node, Effect, EffectKind, Outpoint, Point};
 use ensicoin_messages::resource::script::{Script, OP};
 use ensicoin_serializer::{Deserialize, Deserializer};
 use secp256k1::{PublicKey, SecretKey};
 use std::collections::HashMap;
+
+use futures::Future;
+use hyper::client::connect::{Destination, HttpConnector};
+use tower_grpc::Request;
+use tower_hyper::{client, util};
+use tower_util::MakeService;
 
 #[derive(Debug)]
 pub enum PushError {
@@ -22,6 +28,46 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    pub(crate) fn set_genesis(
+        mut self,
+        uri: http::Uri,
+    ) -> Result<impl Future<Item = Self, Error = super::Error>, super::Error> {
+        let dst = Destination::try_from_uri(uri.clone())?;
+        let connector = util::Connector::new(HttpConnector::new(4));
+        let settings = client::Builder::new().http2_only(true).clone();
+        let mut make_client = client::Connect::with_builder(connector, settings);
+
+        Ok(make_client
+            .make_service(dst)
+            .map_err(super::Error::from)
+            .and_then(move |conn| {
+                use node::client::Node;
+                let conn = tower_request_modifier::Builder::new()
+                    .set_origin(uri)
+                    .build(conn)
+                    .unwrap();
+
+                Node::new(conn).ready().map_err(super::Error::from)
+            })
+            .and_then(|mut client| {
+                client
+                    .get_info(Request::new(node::GetInfoRequest {}))
+                    .map_err(super::Error::from)
+                    .and_then(move |response| {
+                        if self.stack.len() != 0 {
+                            panic!("Cannot init non empty wallet")
+                        };
+                        self.stack = vec![Point {
+                            hash: response.into_inner().genesis_block_hash,
+                            effects: Vec::new(),
+                            height: 0,
+                            previous_hash: Vec::new(),
+                        }];
+                        Ok(self)
+                    })
+            }))
+    }
+
     pub fn affects(&self, txs: Vec<super::Tx>) -> Vec<Effect> {
         let mut affect = Vec::new();
         let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];

@@ -5,6 +5,7 @@ use sodiumoxide::crypto::secretbox;
 use std::{collections::HashMap, io::prelude::*, sync::Arc};
 
 use super::Wallet;
+use futures::Future;
 use parking_lot::RwLock;
 
 impl Wallet {
@@ -33,7 +34,10 @@ impl Wallet {
             pub_key_hash_code,
         })))
     }
-    pub fn with_random_key<P>(path: P) -> Result<(Data, Vec<u8>), StorageError>
+    pub fn with_random_key<P>(
+        path: P,
+        uri: http::Uri,
+    ) -> Result<impl futures::Future<Item = (Data, Vec<u8>), Error = super::Error>, super::Error>
     where
         P: AsRef<std::path::Path>,
     {
@@ -60,7 +64,9 @@ impl Wallet {
         };
         std::fs::File::create(&path).map_err(StorageError::CreationError)?;
         wallet.save(path, key.as_ref())?;
-        Ok((Arc::new(RwLock::new(wallet)), key.as_ref().to_vec()))
+        Ok(wallet
+            .set_genesis(uri)?
+            .map(move |wallet| (Arc::new(RwLock::new(wallet)), key.as_ref().to_vec())))
     }
     pub fn save<P>(&self, path: P, key: &[u8]) -> Result<(), StorageError>
     where
