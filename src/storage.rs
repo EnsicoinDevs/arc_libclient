@@ -63,10 +63,12 @@ impl Wallet {
             stack: Vec::new(),
         };
         std::fs::File::create(&path).map_err(StorageError::CreationError)?;
-        wallet.save(path, key.as_ref())?;
-        Ok(wallet
-            .set_genesis(uri)?
-            .map(move |wallet| (Arc::new(RwLock::new(wallet)), key.as_ref().to_vec())))
+        Ok(wallet.set_genesis(uri)?.and_then(move |wallet| {
+            if let Err(e) = wallet.save(path, key.as_ref()) {
+                return Err(super::Error::from(e));
+            };
+            Ok((Arc::new(RwLock::new(wallet)), key.as_ref().to_vec()))
+        }))
     }
     pub fn save<P>(&self, path: P, key: &[u8]) -> Result<(), StorageError>
     where
