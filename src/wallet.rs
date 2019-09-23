@@ -12,7 +12,10 @@ use tower_util::MakeService;
 
 #[derive(Debug)]
 pub enum PushError {
-    PreviousBlockIsNotTop,
+    PreviousBlockIsNotTop {
+        top: (u32, Vec<u8>),
+        tried: (u32, Vec<u8>),
+    },
 }
 
 pub struct Wallet {
@@ -147,7 +150,14 @@ impl Wallet {
             self.stack.push(point);
             Ok(())
         } else {
-            Err(PushError::PreviousBlockIsNotTop)
+            Err(PushError::PreviousBlockIsNotTop {
+                top: self
+                    .stack
+                    .last()
+                    .map(|p| (p.height.clone(), p.hash.clone()))
+                    .unwrap(),
+                tried: (point.height, point.hash),
+            })
         }
     }
     pub(crate) fn is_next_point(&self, height: u32, prev_hash: &[u8]) -> bool {

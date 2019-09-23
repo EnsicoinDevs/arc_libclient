@@ -167,7 +167,38 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
             }),
     )
     .await?;
+    let chain_height = point.height;
+    let wallet_height = wallet.read().height() as u32;
     let mut last_point = vec![point];
+    if wallet_height > chain_height {
+        let diff = wallet_height - chain_height;
+        for _ in 0..diff {
+            wallet.write().pop()
+        }
+    } else if chain_height > wallet_height {
+        let diff = chain_height - wallet_height;
+        for _ in 0..diff {
+            let block = match futures_new::compat::Compat01As03::new(client.get_block_by_hash(
+                    Request::new(node::GetBlockByHashRequest {
+                        hash: last_point.last().unwrap().previous_hash.clone(),
+                    }),
+            ))
+                .await?
+                .into_inner().block {
+                    Some(b) => b,
+                    None => return Err(Error::MissingBlock),
+                };
+            let header = match block.header {
+                Some(h) => h,
+                None => return Err(Error::MissingHeader),
+            };
+            let effects = wallet.read().affects(block.txs);
+            last_point.push(Point{previous_hash: header.prev_block, hash: header.hash, effects, height: header.height});
+        }
+    }
+
+    // We now have chain_height == wallet_height, and we search for common point
+
     while wallet.read().height() > 1
         && {let point = last_point.last().unwrap(); !wallet.read().is_next_point(point.height, &point.hash)}
     {
@@ -190,6 +221,7 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
         wallet.write().pop();
     }
 
+    // And now just need to re put evrything
     {
         debug!("Top hash is {:?}", wallet.read().top_hash().map(base64::encode));
         let mut wallet_guard = wallet.write();
