@@ -103,7 +103,7 @@ struct Point {
     pub effects: Vec<Effect>,
 }
 
-type Data = Arc<RwLock<Wallet>>;
+pub type Data = Arc<RwLock<Wallet>>;
 
 pub fn for_balance_udpate<F, U>(
     uri: http::Uri,
@@ -168,8 +168,8 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
     )
     .await?;
     let mut last_point = vec![point];
-    while wallet.read().height() > 0
-        && last_point.last().unwrap().previous_hash != wallet.read().top_hash().unwrap()
+    while wallet.read().height() > 1
+        && {let point = last_point.last().unwrap(); !wallet.read().is_next_point(point.height, &point.hash)}
     {
         let block = match futures_new::compat::Compat01As03::new(client.get_block_by_hash(
             Request::new(node::GetBlockByHashRequest {
@@ -189,6 +189,7 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
         last_point.push(Point{previous_hash: header.prev_block, hash: header.hash, effects, height: header.height});
         wallet.write().pop();
     }
+
     {
         debug!("Top hash is {:?}", wallet.read().top_hash().map(base64::encode));
         let mut wallet_guard = wallet.write();

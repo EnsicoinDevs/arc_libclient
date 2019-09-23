@@ -150,7 +150,7 @@ impl Wallet {
             Err(PushError::PreviousBlockIsNotTop)
         }
     }
-    fn is_next_point(&self, height: u32, prev_hash: &[u8]) -> bool {
+    pub(crate) fn is_next_point(&self, height: u32, prev_hash: &[u8]) -> bool {
         self.stack.len() == height as usize && self.stack.last().unwrap().hash == prev_hash
     }
     #[inline]
