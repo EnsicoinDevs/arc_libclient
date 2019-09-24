@@ -1,11 +1,14 @@
+use ensicoin_messages::resource::script::{Script, OP};
+use ensicoin_serializer::Serialize;
 use futures::{Future, Stream};
+pub use http::Uri;
 use hyper::client::connect::{Destination, HttpConnector};
 use parking_lot::RwLock;
+pub use secp256k1;
 use std::sync::Arc;
 use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
-use ensicoin_messages::resource::script::{OP, Script};
 
 mod storage;
 mod wallet;
@@ -18,7 +21,7 @@ pub mod node {
     include!(concat!(env!("OUT_DIR"), "/ensicoin_rpc.rs"));
 }
 
-use node::{Block, GetBestBlocksRequest, GetBlockByHashRequest, PublishRawTxRequest, Tx};
+use node::{GetBestBlocksRequest, GetBlockByHashRequest, PublishRawTxRequest, Tx};
 
 #[derive(Debug)]
 pub enum Error {
@@ -30,6 +33,7 @@ pub enum Error {
     MissingHeader,
     MissingBlock,
     PushedWrongPoint(wallet::PushError),
+    InsufficientFunds,
 }
 
 impl From<wallet::PushError> for Error {
@@ -105,6 +109,42 @@ struct Point {
 }
 
 pub type Data = Arc<RwLock<Wallet>>;
+
+pub fn pay_to(
+    uri: http::Uri,
+    wallet: Data,
+    value: u64,
+    recipient: &secp256k1::PublicKey,
+) -> Result<impl Future<Item = node::PublishRawTxReply, Error = Error>, Error> {
+    let tx = match wallet.read().tx_to_of_value(value, recipient) {
+        Some(t) => t,
+        None => return Err(Error::InsufficientFunds),
+    };
+    let dst = Destination::try_from_uri(uri.clone())?;
+    let connector = util::Connector::new(HttpConnector::new(4));
+    let settings = client::Builder::new().http2_only(true).clone();
+    let mut make_client = client::Connect::with_builder(connector, settings);
+    Ok(make_client
+        .make_service(dst)
+        .map_err(Error::from)
+        .and_then(move |conn| {
+            use node::client::Node;
+            let conn = tower_request_modifier::Builder::new()
+                .set_origin(uri)
+                .build(conn)
+                .unwrap();
+
+            Node::new(conn).ready().map_err(Error::from)
+        })
+        .and_then(move |mut client| {
+            client
+                .publish_raw_tx(Request::new(PublishRawTxRequest {
+                    raw_tx: tx.serialize().to_vec(),
+                }))
+                .map_err(Error::from)
+        })
+        .and_then(|response| Ok(response.into_inner())))
+}
 
 fn script_directed_to(hash_160_pub_key_as_op: &[OP]) -> Script {
     let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];
@@ -193,36 +233,46 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
         let diff = chain_height - wallet_height;
         for _ in 0..diff {
             let block = match futures_new::compat::Compat01As03::new(client.get_block_by_hash(
-                    Request::new(node::GetBlockByHashRequest {
-                        hash: last_point.last().unwrap().previous_hash.clone(),
-                    }),
+                Request::new(node::GetBlockByHashRequest {
+                    hash: last_point.last().unwrap().previous_hash.clone(),
+                }),
             ))
-                .await?
-                .into_inner().block {
-                    Some(b) => b,
-                    None => return Err(Error::MissingBlock),
-                };
+            .await?
+            .into_inner()
+            .block
+            {
+                Some(b) => b,
+                None => return Err(Error::MissingBlock),
+            };
             let header = match block.header {
                 Some(h) => h,
                 None => return Err(Error::MissingHeader),
             };
             let effects = wallet.read().affects(block.txs);
-            last_point.push(Point{previous_hash: header.prev_block, hash: header.hash, effects, height: header.height});
+            last_point.push(Point {
+                previous_hash: header.prev_block,
+                hash: header.hash,
+                effects,
+                height: header.height,
+            });
         }
     }
 
     // We now have chain_height == wallet_height, and we search for common point
 
-    while wallet.read().height() > 1
-        && {let point = last_point.last().unwrap(); !wallet.read().is_next_point(point.height, &point.hash)}
-    {
+    while wallet.read().height() > 1 && {
+        let point = last_point.last().unwrap();
+        !wallet.read().is_next_point(point.height, &point.hash)
+    } {
         let block = match futures_new::compat::Compat01As03::new(client.get_block_by_hash(
             Request::new(node::GetBlockByHashRequest {
                 hash: last_point.last().unwrap().previous_hash.clone(),
             }),
         ))
         .await?
-        .into_inner().block {
+        .into_inner()
+        .block
+        {
             Some(b) => b,
             None => return Err(Error::MissingBlock),
         };
@@ -231,13 +281,21 @@ async fn push_wallet(uri: http::Uri, wallet: Data, point: Point) -> Result<u64, 
             None => return Err(Error::MissingHeader),
         };
         let effects = wallet.read().affects(block.txs);
-        last_point.push(Point{previous_hash: header.prev_block, hash: header.hash, effects, height: header.height});
+        last_point.push(Point {
+            previous_hash: header.prev_block,
+            hash: header.hash,
+            effects,
+            height: header.height,
+        });
         wallet.write().pop();
     }
 
     // And now just need to re put evrything
     {
-        debug!("Top hash is {:?}", wallet.read().top_hash().map(base64::encode));
+        debug!(
+            "Top hash is {:?}",
+            wallet.read().top_hash().map(base64::encode)
+        );
         let mut wallet_guard = wallet.write();
         while let Some(point) = last_point.pop() {
             debug!("Writing {}", base64::encode(&point.hash));
