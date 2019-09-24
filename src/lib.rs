@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tower_grpc::Request;
 use tower_hyper::{client, util};
 use tower_util::MakeService;
+use ensicoin_messages::resource::script::{OP, Script};
 
 mod storage;
 mod wallet;
@@ -104,6 +105,19 @@ struct Point {
 }
 
 pub type Data = Arc<RwLock<Wallet>>;
+
+fn script_directed_to(hash_160_pub_key_as_op: &[OP]) -> Script {
+    let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];
+    script.extend_from_slice(hash_160_pub_key_as_op);
+    script.append(&mut vec![OP::Equal, OP::Verify, OP::Checksig]);
+    Script::from(script)
+}
+fn pub_key_to_op(pub_key: &secp256k1::PublicKey) -> Vec<OP> {
+    use ripemd160::{Digest, Ripemd160};
+    let mut hasher = Ripemd160::new();
+    hasher.input(&pub_key.serialize()[..]);
+    hasher.result().into_iter().map(|b| OP::Byte(b)).collect()
+}
 
 pub fn for_balance_udpate<F, U>(
     uri: http::Uri,

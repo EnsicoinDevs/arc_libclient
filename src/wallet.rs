@@ -1,6 +1,12 @@
 use super::{node, Effect, EffectKind, Outpoint, Point};
-use ensicoin_messages::resource::script::{Script, OP};
-use ensicoin_serializer::{Deserialize, Deserializer};
+use ensicoin_messages::resource::{
+    script::{Script, OP},
+    tx,
+    tx::Transaction,
+    tx::TransactionInput,
+    tx::TransactionOutput,
+};
+use ensicoin_serializer::{Deserialize, Deserializer, Sha256Result};
 use secp256k1::{PublicKey, SecretKey};
 use std::collections::HashMap;
 
@@ -28,9 +34,79 @@ pub struct Wallet {
     pub(crate) stack: Vec<Point>,
 
     pub(crate) nonce: sodiumoxide::crypto::secretbox::Nonce,
+
+    pub(crate) signing_engine: secp256k1::Secp256k1<secp256k1::SignOnly>,
 }
 
 impl Wallet {
+    pub(crate) fn tx_to_of_value(
+        &self,
+        value: u64,
+        to: &secp256k1::PublicKey,
+    ) -> Option<Transaction> {
+        let mut current_avail = 0;
+        let mut outpoints = Vec::new();
+        let mut values = Vec::new();
+        for (out, val) in &self.owned_tx {
+            if current_avail >= value {
+                break;
+            } else {
+                outpoints.push(out.clone());
+                values.push(*val);
+                current_avail += val;
+            }
+        }
+        if current_avail < value {
+            None
+        } else {
+            let surplus = current_avail - value;
+            let outputs = vec![
+                TransactionOutput {
+                    script: crate::script_directed_to(&crate::pub_key_to_op(&to)),
+                    value,
+                },
+                TransactionOutput {
+                    script: crate::script_directed_to(&crate::pub_key_to_op(&self.pub_key)),
+                    value: surplus,
+                },
+            ];
+            let inputs: Vec<_> = outpoints
+                .into_iter()
+                .map(|previous_output| TransactionInput {
+                    previous_output: tx::Outpoint {
+                        hash: Sha256Result::clone_from_slice(&previous_output.hash),
+                        index: previous_output.index,
+                    },
+                    script: Script::from(Vec::new()),
+                })
+                .collect();
+            let mut tx = Transaction {
+                version: 1,
+                flags: vec!["42".to_owned()],
+                inputs,
+                outputs,
+            };
+            for i in 0..tx.inputs.len() {
+                let shash = tx.shash(i, values[i]);
+                let signature = self
+                    .signing_engine
+                    .sign(
+                        &secp256k1::Message::from_slice(shash.as_slice())
+                            .expect("Hash is not hash"),
+                        &self.secret_key,
+                    )
+                    .serialize_der();
+                let sig_len = signature.len();
+                let mut input_script = vec![OP::Push(sig_len as u8)];
+                input_script.extend(signature.into_iter().map(|b| OP::Byte(*b)));
+                input_script.push(OP::Push(self.pub_key_hash_code.len() as u8));
+                input_script.extend_from_slice(&self.pub_key_hash_code);
+                tx.inputs[i].script = Script::from(input_script);
+            }
+            Some(tx)
+        }
+    }
+
     pub(crate) fn set_genesis(
         mut self,
         uri: http::Uri,
@@ -73,10 +149,7 @@ impl Wallet {
 
     pub fn affects(&self, txs: Vec<super::Tx>) -> Vec<Effect> {
         let mut affect = Vec::new();
-        let mut script = vec![OP::Dup, OP::Hash160, OP::Push(20)];
-        script.extend_from_slice(&self.pub_key_hash_code);
-        script.append(&mut vec![OP::Equal, OP::Verify, OP::Checksig]);
-        let script = ensicoin_messages::resource::script::Script::from(script);
+        let script = crate::script_directed_to(&self.pub_key_hash_code);
         for tx in txs {
             let hash = tx.hash;
             for input in tx.inputs {

@@ -32,6 +32,7 @@ impl Wallet {
             pub_key: storage.pub_key,
             secret_key: storage.secret_key,
             pub_key_hash_code,
+            signing_engine: Secp256k1::signing_only(),
         })))
     }
     pub fn with_random_key<P>(
@@ -46,11 +47,7 @@ impl Wallet {
         let mut rng = rand::thread_rng();
         let (secret_key, pub_key) = secp.generate_keypair(&mut rng);
 
-        use ripemd160::{Digest, Ripemd160};
-        let mut hasher = Ripemd160::new();
-        hasher.input(&pub_key.serialize()[..]);
-        let pub_key_hash_code = hasher.result().into_iter().map(|b| OP::Byte(b)).collect();
-        // TODO: Not forget on load
+        let pub_key_hash_code = crate::pub_key_to_op(&pub_key);
         sodiumoxide::init().expect("Crypto creation");
 
         let (key, nonce) = DiskStorage::create_crypto();
@@ -59,6 +56,7 @@ impl Wallet {
             secret_key,
             pub_key,
             pub_key_hash_code,
+            signing_engine: Secp256k1::signing_only(),
             owned_tx: HashMap::new(),
             stack: Vec::new(),
         };
